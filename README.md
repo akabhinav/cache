@@ -20,9 +20,12 @@ A high-performance, distributed cache system similar to Redis, implemented in Ja
   - No eviction
 
 ### Distribution & Clustering
-- **Consistent Hashing**: Efficient key distribution across cluster nodes
-- **Cluster Management**: Dynamic node addition/removal
-- **Replication**: Configurable replication factor for high availability
+- **Gossip Protocol**: Node discovery and failure detection (UDP-based, 1s heartbeats)
+- **Leader Election**: Bully algorithm for cluster coordination (NO single point of failure)
+- **Consistent Hashing**: Efficient key distribution across cluster nodes (150 virtual nodes per physical node)
+- **Cluster Management**: Dynamic node addition/removal with automatic rebalancing
+- **Data Replication**: Async replication with configurable factor (eventual consistency)
+- **Failure Detection**: Automatic detection and recovery from node failures
 - **Virtual Threads**: Leveraging Java 21's virtual threads for high concurrency
 
 ### Pub/Sub
@@ -48,7 +51,9 @@ mvn clean package
 
 ## Running the Server
 
-Start a Redis-Java server on the default port (6379):
+### Standalone Mode
+
+Start a single Redis-Java server:
 
 ```bash
 java -jar target/redis-java-1.0.0.jar
@@ -59,6 +64,35 @@ Or specify a custom port:
 ```bash
 java -jar target/redis-java-1.0.0.jar 7000
 ```
+
+### Distributed Mode (Recommended)
+
+Start a distributed cluster with coordination:
+
+**Node 1 (Seed)**:
+```bash
+java -cp target/redis-java-1.0.0.jar \
+  com.distributedcache.redis.cluster.DistributedRedisServer \
+  --port 6379 --gossip-port 7379 --node-id node-1
+```
+
+**Node 2**:
+```bash
+java -cp target/redis-java-1.0.0.jar \
+  com.distributedcache.redis.cluster.DistributedRedisServer \
+  --port 6380 --gossip-port 7380 --node-id node-2 \
+  --seed localhost:7379:node-1
+```
+
+**Node 3**:
+```bash
+java -cp target/redis-java-1.0.0.jar \
+  com.distributedcache.redis.cluster.DistributedRedisServer \
+  --port 6381 --gossip-port 7381 --node-id node-3 \
+  --seed localhost:7379:node-1
+```
+
+See [DISTRIBUTED_ARCHITECTURE.md](DISTRIBUTED_ARCHITECTURE.md) for detailed coordination architecture.
 
 ## Using the Client
 
@@ -108,22 +142,27 @@ String result = pool.execute(client -> {
 pool.close();
 ```
 
-### Cluster Setup
+### Distributed Cluster Setup
 
 ```java
-// Create cluster nodes
-ClusterNode node1 = new ClusterNode("localhost", 6379, "node-1");
-ClusterNode node2 = new ClusterNode("localhost", 6380, "node-2");
-ClusterNode node3 = new ClusterNode("localhost", 6381, "node-3");
+// Start a distributed cluster with full coordination
+DistributedRedisServer server = new DistributedRedisServer.Builder()
+    .host("localhost")
+    .port(6379)
+    .gossipPort(7379)
+    .nodeId("node-1")
+    .replicationFactor(3)
+    .addSeedNode("otherhost", 7379, "seed-node")
+    .build();
 
-// Initialize cluster manager
-ClusterManager cluster = new ClusterManager(node1, 3); // replication factor = 3
-cluster.addNode(node2);
-cluster.addNode(node3);
+server.start();
+
+// Check cluster status
+System.out.println(server.getClusterInfo());
+System.out.println("Is leader: " + server.isLeader());
 
 // Route keys to appropriate nodes
-ClusterNode responsible = cluster.getNodeForKey("user:123");
-List<ClusterNode> replicas = cluster.getNodesForKey("user:123");
+ClusterNode responsible = server.getClusterManager().getNodeForKey("user:123");
 ```
 
 ## Supported Commands
@@ -164,48 +203,66 @@ List<ClusterNode> replicas = cluster.getNodesForKey("user:123");
 
 ## Architecture
 
-### Components
+### Distributed Architecture Overview
 
 ```
-┌─────────────────────────────────────────────┐
-│             Client Applications              │
-└──────────────────┬──────────────────────────┘
-                   │
-                   ▼
-┌─────────────────────────────────────────────┐
-│          Redis Client / Pool                │
-│  (Connection Management, RESP Encoding)      │
-└──────────────────┬──────────────────────────┘
-                   │
-                   ▼
-┌─────────────────────────────────────────────┐
-│            Redis Server                      │
-│  ┌────────────────────────────────────────┐ │
-│  │   Client Handler (Virtual Threads)     │ │
-│  └───────────────┬────────────────────────┘ │
-│                  │                           │
-│  ┌───────────────▼────────────────────────┐ │
-│  │      Command Registry & Execution      │ │
-│  └───────────────┬────────────────────────┘ │
-│                  │                           │
-│  ┌───────────────▼────────────────────────┐ │
-│  │       Data Store (In-Memory)           │ │
-│  │   - TTL Management                      │ │
-│  │   - Eviction Policies                   │ │
-│  │   - Concurrent Access                   │ │
-│  └─────────────────────────────────────────┘ │
-└─────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────┐
-│          Cluster Manager                     │
-│  ┌────────────────────────────────────────┐ │
-│  │      Consistent Hashing Ring           │ │
-│  └────────────────────────────────────────┘ │
-│  ┌────────────────────────────────────────┐ │
-│  │      Node Management & Routing         │ │
-│  └────────────────────────────────────────┘ │
-└─────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                     Redis Cluster                            │
+│                                                              │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐ │
+│  │   Node 1     │    │   Node 2     │    │   Node 3     │ │
+│  │  (Leader)    │◄──►│              │◄──►│              │ │
+│  ├──────────────┤    ├──────────────┤    ├──────────────┤ │
+│  │ Redis :6379  │    │ Redis :6380  │    │ Redis :6381  │ │
+│  │ Gossip :7379 │    │ Gossip :7380 │    │ Gossip :7381 │ │
+│  ├──────────────┤    ├──────────────┤    ├──────────────┤ │
+│  │ • DataStore  │    │ • DataStore  │    │ • DataStore  │ │
+│  │ • Replication│    │ • Replication│    │ • Replication│ │
+│  │ • Leader Mgr │    │ • Leader Mgr │    │ • Leader Mgr │ │
+│  └──────────────┘    └──────────────┘    └──────────────┘ │
+│         ▲                    ▲                    ▲         │
+│         └────────Gossip Protocol (UDP)────────────┘         │
+│         └────────Consistent Hash Ring─────────────┘         │
+└─────────────────────────────────────────────────────────────┘
+              ▲
+              │
+    ┌─────────┴─────────┐
+    │  Redis Clients    │
+    │  (Any node, any   │
+    │   port works)     │
+    └───────────────────┘
 ```
+
+### Coordination Components
+
+1. **Gossip Protocol** (`GossipProtocol.java`)
+   - Node discovery via periodic heartbeats (1s interval)
+   - Failure detection (3s suspect, 5s dead)
+   - State dissemination across cluster
+   - UDP-based for efficiency
+
+2. **Leader Election** (`LeaderElection.java`)
+   - Bully algorithm (highest node ID wins)
+   - Automatic re-election on leader failure
+   - Coordinates cluster-wide operations
+   - **Not a single point of failure** - just for coordination
+
+3. **Consistent Hashing** (`ConsistentHash.java`)
+   - 150 virtual nodes per physical node
+   - Minimal data movement on topology changes
+   - Deterministic key→node mapping
+
+4. **Replication Manager** (`ReplicationManager.java`)
+   - Async replication to N nodes
+   - Eventual consistency model
+   - Background queue processing
+
+5. **Cluster Manager** (`ClusterManager.java`)
+   - Tracks cluster topology
+   - Routes keys to correct nodes
+   - Handles node join/leave events
+
+See [DISTRIBUTED_ARCHITECTURE.md](DISTRIBUTED_ARCHITECTURE.md) for complete details.
 
 ### Key Design Decisions
 
@@ -250,8 +307,14 @@ mvn test
 
 See the `examples` package for complete working examples:
 - `BasicUsageExample.java` - Basic client operations
-- `ClusterExample.java` - Cluster management
+- `ClusterExample.java` - Cluster management (simple)
+- `DistributedClusterExample.java` - Full distributed cluster with coordination
 - `ConnectionPoolExample.java` - Connection pooling
+
+Run examples:
+```bash
+mvn exec:java -Dexec.mainClass="com.distributedcache.redis.examples.DistributedClusterExample"
+```
 
 ## Limitations
 
